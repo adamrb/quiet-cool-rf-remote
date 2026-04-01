@@ -39,6 +39,7 @@ async def to_code(config):
     await cg.register_component(var, config)
     await fan.register_fan(var, config)
     await spi.register_spi_device(var, config)
+    cg.add_library("SPI", None)
 
     cs_num = config[spi.CONF_CS_PIN]["number"]
     cg.add(var.set_pins(cs_num, config[CONF_GDO0_PIN], config[CONF_GDO2_PIN]))
