@@ -35,6 +35,7 @@ CONFIG_SCHEMA = fan.fan_schema(QuietCoolFan).extend(
 
 
 async def to_code(config):
+    cg.add_library("SPI", None)  # CC1101 driver includes Arduino <SPI.h>
     var = cg.new_Pvariable(config[CONF_OUTPUT_ID])  # type: QuietCoolFan
     await cg.register_component(var, config)
     await fan.register_fan(var, config)
