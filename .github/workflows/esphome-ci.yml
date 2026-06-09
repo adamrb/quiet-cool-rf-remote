@@ -1,6 +1,7 @@
 name: ESPHome CI
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - '**.yaml'
