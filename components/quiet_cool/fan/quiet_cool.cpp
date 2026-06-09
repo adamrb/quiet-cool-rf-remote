@@ -1,343 +1,262 @@
 #include "quiet_cool.h"
+#include "esphome/core/hal.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
-#include "quietcool.h"
-#include <cstring>  // for memmove, memcpy
-#include <Arduino.h>  // for digitalRead
-#include "ELECHOUSE_CC1101_SRC_DRV.h"  // for register readback
 
 namespace esphome {
-    namespace quiet_cool {
-        
-        static const char *TAG = "quiet_cool.fan";
+namespace quiet_cool {
 
-        void QuietCoolFan::setup() {
-            ESP_LOGD(TAG, "setup: pins_set=%s csn=%d gdo0=%d gdo2=%d",
-                     this->pins_set_ ? "true" : "false", this->csn_pin_, this->gdo0_pin_, this->gdo2_pin_);
+static const char *TAG = "quiet_cool.fan";
 
-            if (!this->pins_set_) {
-                ESP_LOGE(TAG, "QuietCool pins not configured via YAML; radio not initialised");
-                return;
-            }
+static constexpr uint32_t PAIRING_WINDOW_MS = 60000;
+static constexpr uint32_t WAKE_POLL_INTERVAL_MS = 30000;
+static constexpr uint32_t CONFIRM_POLL_DELAY_MS = 2000;
+static constexpr uint32_t RX_DEDUP_WINDOW_MS = 1000;
+static constexpr uint32_t DIAG_LOG_INTERVAL_MS = 10000;
 
-            if (this->qc_ == nullptr) {
-                this->qc_.reset(new QuietCool(this->csn_pin_, this->gdo0_pin_, this->gdo2_pin_, 18, 19, 23, remote_id_.data(), center_freq_mhz, deviation_khz));
-            }
+static std::string id_to_string(const RemoteId &id) {
+    return format_hex_pretty(id.data(), id.size());
+}
 
-            this->qc_->begin();
-            ESP_LOGI(TAG, "QuietCool initialized");
+void QuietCoolFan::setup() {
+    this->spi_setup();
+
+    // Wake the chip per datasheet 19.1.2 (CS toggle, then wait for ready).
+    this->cs_->digital_write(false);
+    delayMicroseconds(10);
+    this->cs_->digital_write(true);
+    delayMicroseconds(45);
+
+    this->radio_ = make_unique<CC1101>(static_cast<CC1101Spi *>(this));
+    if (!this->radio_->reset_and_verify()) {
+        ESP_LOGE(TAG, "CC1101 not detected — check SPI wiring");
+        this->mark_failed();
+        return;
+    }
+
+    this->radio_->configure(this->center_freq_mhz_, this->deviation_khz_);
+    if (!this->radio_->recover_to_rx()) {
+        ESP_LOGE(TAG, "CC1101 failed to enter RX mode");
+        this->mark_failed();
+        return;
+    }
+
+    // Restore paired remotes; seed with the YAML remote_id if given.
+    this->paired_pref_ =
+        global_preferences->make_preference<PairedRemotes>(this->get_object_id_hash());
+    if (!this->paired_pref_.load(&this->paired_))
+        this->paired_ = PairedRemotes{};
+    if (this->yaml_id_set_)
+        this->add_paired_(this->yaml_id_);
+
+    this->radio_task_ = make_unique<RadioTask>(this->radio_.get(), this->gdo0_pin_);
+    if (!this->radio_task_->start()) {
+        this->mark_failed();
+        return;
+    }
+
+    if (const RemoteId *id = this->primary_id_()) {
+        ESP_LOGI(TAG, "Using remote ID %s (%u paired)", id_to_string(*id).c_str(),
+                 this->paired_.count);
+        this->radio_task_->set_wake_poll(*id, WAKE_POLL_INTERVAL_MS);
+    } else {
+        ESP_LOGW(TAG, "No remote paired — entering pairing mode. Press any button "
+                      "on your QuietCool remote within 60 seconds.");
+        this->start_pairing();
+    }
+}
+
+fan::FanTraits QuietCoolFan::get_traits() {
+    return fan::FanTraits(false, true, false, this->speed_count_);
+}
+
+void QuietCoolFan::loop() {
+    if (this->radio_task_ == nullptr)
+        return;
+
+    RxEvent event;
+    while (this->radio_task_->poll_rx(event)) {
+        this->handle_rx_event_(event);
+    }
+
+    uint32_t now = millis();
+    if (this->pairing_until_ms_ != 0 && now > this->pairing_until_ms_) {
+        this->pairing_until_ms_ = 0;
+        ESP_LOGW(TAG, "Pairing window closed (no remote heard)");
+    }
+
+    if (now - this->last_diag_log_ms_ >= DIAG_LOG_INTERVAL_MS) {
+        this->last_diag_log_ms_ = now;
+        ESP_LOGD(TAG, "Radio: MARCSTATE=0x%02X pkts=%u dropped=%u overflows=%u tx_fail=%u",
+                 this->radio_task_->last_marcstate(), this->radio_task_->rx_packet_count(),
+                 this->radio_task_->rx_dropped_count(), this->radio_task_->overflow_count(),
+                 this->radio_task_->tx_fail_count());
+    }
+}
+
+void QuietCoolFan::handle_rx_event_(const RxEvent &event) {
+    const char *source = (event.rssi_dbm > -70) ? "FAN" : "REMOTE";
+    ESP_LOGI(TAG, "RX [%s] from %s result=%d RSSI=%d LQI=%u", source,
+             id_to_string(event.sender).c_str(), static_cast<int>(event.result),
+             event.rssi_dbm, event.lqi);
+
+    if (event.result != DecodeResult::OK && event.result != DecodeResult::OK_CORRECTED) {
+        ESP_LOGW(TAG, "Undecodable packet from %s ignored (reason %d)",
+                 id_to_string(event.sender).c_str(), static_cast<int>(event.result));
+        return;
+    }
+
+    if (this->pairing_until_ms_ != 0 && millis() < this->pairing_until_ms_) {
+        bool was_empty = this->paired_.count == 0;
+        if (this->add_paired_(event.sender)) {
+            this->pairing_until_ms_ = 0;
+            ESP_LOGI(TAG, "Paired remote %s (%u total)",
+                     id_to_string(event.sender).c_str(), this->paired_.count);
+            if (was_empty)
+                this->radio_task_->set_wake_poll(event.sender, WAKE_POLL_INTERVAL_MS);
         }
+    }
 
-        void QuietCoolFan::reinit_radio() {
-            if (this->qc_) {
-                ESP_LOGI(TAG, "Re-initializing radio");
-                this->qc_->begin();
+    if (!this->is_paired_(event.sender)) {
+        ESP_LOGD(TAG, "Command from unpaired remote %s ignored",
+                 id_to_string(event.sender).c_str());
+        return;
+    }
+
+    if (event.cmd.is_wake)
+        return;  // WAKE carries no state
+
+    // The remote repeats each command within a burst; collapse duplicates.
+    uint32_t now = millis();
+    bool duplicate = (now - this->last_rx_ms_ < RX_DEDUP_WINDOW_MS) &&
+                     (event.cmd.is_off == this->last_rx_was_off_) &&
+                     (event.cmd.speed == this->last_rx_cmd_speed_);
+    this->last_rx_ms_ = now;
+    this->last_rx_was_off_ = event.cmd.is_off;
+    this->last_rx_cmd_speed_ = event.cmd.speed;
+    if (!duplicate)
+        this->apply_rx_command_(event.cmd);
+}
+
+void QuietCoolFan::apply_rx_command_(const RxCommand &cmd) {
+    if (cmd.is_off) {
+        this->state = false;
+        this->speed = 0;
+        ESP_LOGI(TAG, "RX sync: OFF");
+    } else {
+        this->state = true;
+        this->speed = cmd_to_speed_level(cmd.speed, this->speed_count_);
+        ESP_LOGI(TAG, "RX sync: ON speed=%d", this->speed);
+    }
+    this->publish_state();
+}
+
+void QuietCoolFan::control(const fan::FanCall &call) {
+    if (call.get_state().has_value()) {
+        bool new_state = *call.get_state();
+        if (new_state) {
+            if (call.get_speed().has_value()) {
+                this->speed = *call.get_speed();
+            } else if (this->speed == 0 || !this->state) {
+                this->speed = 1;  // default to LOW when turning on cold
             }
+            this->state = true;
+        } else {
+            this->state = false;
+            this->speed = 0;
         }
+    } else if (call.get_speed().has_value()) {
+        this->speed = *call.get_speed();
+        this->state = this->speed != 0;
+    }
 
-        void QuietCoolFan::scan_frequencies() {
-            ESP_LOGI(TAG, "=== FREQUENCY SCAN STARTED ===");
-            if (!this->qc_) {
-                ESP_LOGE(TAG, "Cannot scan - qc_ is null!");
-                return;
-            }
+    uint8_t cmd;
+    if (!this->state || this->speed == 0) {
+        cmd = CMD_OFF;
+    } else {
+        auto hw_speed = static_cast<QuietCoolSpeed>(
+            speed_level_to_cmd(this->speed, this->speed_count_));
+        cmd = make_command(hw_speed, QUIETCOOL_DURATION_ON);
+    }
 
-            // Scan from 433.85 to 433.95 MHz in 5 kHz steps
-            float original_freq = this->center_freq_mhz;
-            ESP_LOGI(TAG, "Original frequency: %.3f MHz", original_freq);
+    const RemoteId *id = this->primary_id_();
+    if (id == nullptr) {
+        ESP_LOGW(TAG, "No remote paired; cannot transmit (pair one first)");
+    } else if (this->radio_task_ != nullptr && this->radio_task_->queue_tx(*id, cmd)) {
+        ESP_LOGI(TAG, "Queued TX cmd=0x%02X (state=%s speed=%d)", cmd,
+                 ONOFF(this->state), this->speed);
+        // Publish optimistically now; a WAKE shortly after makes the fan report
+        // its actual state, correcting HA if the command wasn't heard.
+        this->set_timeout("confirm_wake", CONFIRM_POLL_DELAY_MS, [this]() {
+            this->send_wake();
+        });
+    }
 
-            for (float freq = 433.850; freq <= 433.950; freq += 0.005) {
-                ESP_LOGI(TAG, "Testing frequency: %.3f MHz", freq);
+    this->publish_state();
+}
 
-                // Update frequency in QuietCool object and reinit
-                this->qc_->set_frequency(freq);
-                this->qc_->begin();
+void QuietCoolFan::send_wake() {
+    const RemoteId *id = this->primary_id_();
+    if (id != nullptr && this->radio_task_ != nullptr) {
+        ESP_LOGD(TAG, "Queueing WAKE state query");
+        this->radio_task_->queue_tx(*id, CMD_WAKE);
+    }
+}
 
-                // Send LOW speed, ON command
-                this->qc_->send(QUIETCOOL_SPEED_LOW, QUIETCOOL_DURATION_ON);
+void QuietCoolFan::start_pairing() {
+    this->pairing_until_ms_ = millis() + PAIRING_WINDOW_MS;
+    ESP_LOGI(TAG, "Pairing window open for %us — press any button on the remote",
+             (unsigned) (PAIRING_WINDOW_MS / 1000));
+}
 
-                // Wait between transmissions
-                delay(2000);
-            }
+void QuietCoolFan::clear_paired_remotes() {
+    this->paired_ = PairedRemotes{};
+    this->paired_pref_.save(&this->paired_);
+    ESP_LOGI(TAG, "All paired remotes cleared");
+}
 
-            // Restore original frequency
-            this->qc_->set_frequency(original_freq);
-            this->qc_->begin();
-            ESP_LOGI(TAG, "=== FREQUENCY SCAN COMPLETE ===");
-            ESP_LOGI(TAG, "Restored original frequency: %.3f MHz", original_freq);
-        }
+bool QuietCoolFan::is_paired_(const RemoteId &id) const {
+    for (uint8_t i = 0; i < this->paired_.count; i++) {
+        if (memcmp(this->paired_.ids[i], id.data(), id.size()) == 0)
+            return true;
+    }
+    return false;
+}
 
-        fan::FanTraits QuietCoolFan::get_traits() {
-            return fan::FanTraits(false, true, false, this->speed_count_);
-        }
+bool QuietCoolFan::add_paired_(const RemoteId &id) {
+    if (this->is_paired_(id))
+        return false;
+    if (this->paired_.count >= MAX_PAIRED_REMOTES) {
+        // Evict the oldest non-primary entry (slot 1).
+        for (uint8_t i = 1; i + 1 < MAX_PAIRED_REMOTES; i++)
+            memcpy(this->paired_.ids[i], this->paired_.ids[i + 1], 7);
+        this->paired_.count = MAX_PAIRED_REMOTES - 1;
+    }
+    memcpy(this->paired_.ids[this->paired_.count], id.data(), id.size());
+    this->paired_.count++;
+    this->paired_pref_.save(&this->paired_);
+    return true;
+}
 
-        void QuietCoolFan::loop() {
-            uint32_t now = millis();
+const RemoteId *QuietCoolFan::primary_id_() const {
+    if (this->paired_.count == 0)
+        return nullptr;
+    // PairedRemotes stores raw bytes; RemoteId is a std::array with identical layout.
+    return reinterpret_cast<const RemoteId *>(&this->paired_.ids[0]);
+}
 
-            if (!this->qc_) {
-                return;
-            }
+void QuietCoolFan::dump_config() {
+    LOG_FAN("", "QuietCool fan", this);
+    ESP_LOGCONFIG(TAG, "  GDO0 Pin: %u", this->gdo0_pin_);
+    ESP_LOGCONFIG(TAG, "  Frequency: %.3f MHz (deviation %.1f kHz)",
+                  this->center_freq_mhz_, this->deviation_khz_);
+    ESP_LOGCONFIG(TAG, "  Speed Count: %d", this->speed_count_);
+    ESP_LOGCONFIG(TAG, "  Paired Remotes: %u", this->paired_.count);
+    for (uint8_t i = 0; i < this->paired_.count; i++) {
+        ESP_LOGCONFIG(TAG, "    [%u] %s", i,
+                      format_hex_pretty(this->paired_.ids[i], 7).c_str());
+    }
+}
 
-            // Periodic calibration for long-term stability (every 5 minutes)
-            static uint32_t last_cal = 0;
-            if (now - last_cal > 300000) {
-                this->qc_->calibrate();
-                last_cal = now;
-            }
-
-            // Periodic MARCSTATE monitoring (every 10 seconds) — safety net
-            static uint32_t last_log = 0;
-            static bool regs_logged = false;
-            if (now - last_log > 10000) {
-                uint8_t marcstate = this->qc_->getMarcState();
-                ESP_LOGD(TAG, "CC1101 MARCSTATE: 0x%02X (0x0D = RX)", marcstate);
-                ESP_LOGD(TAG, "RX stats: pkts=%lu, overflows=%lu, gdo0_blocked=%lu",
-                         rx_packet_count_, overflow_count_, gdo0_blocked_count_);
-
-                // One-time register readback (setup logs lost before API connects)
-                if (!regs_logged) {
-                    regs_logged = true;
-                    uint8_t mdmcfg2 = ELECHOUSE_cc1101.SpiReadReg(0x12);
-                    uint8_t pktctrl1 = ELECHOUSE_cc1101.SpiReadReg(0x07);
-                    uint8_t foccfg = ELECHOUSE_cc1101.SpiReadReg(0x19);
-                    uint8_t bscfg = ELECHOUSE_cc1101.SpiReadReg(0x1A);
-                    ESP_LOGI(TAG, "Regs: MDMCFG2=0x%02X(SYNC_MODE=%d) PKTCTRL1=0x%02X(PQT=%d) FOCCFG=0x%02X BSCFG=0x%02X",
-                             mdmcfg2, mdmcfg2 & 0x07, pktctrl1, (pktctrl1 >> 5) & 0x07, foccfg, bscfg);
-                }
-
-                if (marcstate == 0x11 || marcstate == 0x16) {
-                    ESP_LOGW(TAG, "CC1101 FIFO error (state 0x%02X) - recovering", marcstate);
-                    this->qc_->recoverFromFifoError();
-                } else if (marcstate != 0x0D && marcstate != 0x1F) {
-                    ESP_LOGW(TAG, "CC1101 not in RX (state 0x%02X) - forcing RX", marcstate);
-                    this->qc_->forceRxMode();
-                }
-
-                last_log = now;
-            }
-
-            // Periodic WAKE poll (every 30s) — query fan state
-            static uint32_t last_wake = 0;
-            if (now - last_wake > 30000) {
-                ESP_LOGD(TAG, "Periodic WAKE poll");
-                this->qc_->sendWake();
-                last_wake = millis();  // Use millis() after sendWake() completes (~500ms)
-            }
-
-            // --- Drain all complete packets from FIFO ---
-            // Dual-condition read: satisfies TI FIFO errata (SWRZ020) while allowing
-            // aggressive draining during burst reception (3 packets in ~250ms).
-            uint8_t packets_this_loop = 0;
-            while (true) {
-                // Double-read RXBYTES per TI recommendation (use lower value)
-                uint8_t rb1 = this->qc_->getRxBytes();
-                uint8_t rb2 = this->qc_->getRxBytes();
-                uint8_t rxbytes_raw = (rb1 < rb2) ? rb1 : rb2;
-                bool overflow = rxbytes_raw & 0x80;
-                uint8_t rxbytes = rxbytes_raw & 0x7F;
-
-                if (overflow) {
-                    ESP_LOGW(TAG, "RX FIFO overflow - recovering");
-                    this->qc_->recoverFromFifoError();
-                    overflow_count_++;
-                    break;
-                }
-
-                // Dual-condition: safe to read when either:
-                // (a) 2+ packets buffered — reading 22 leaves ≥22, so SPI read pointer
-                //     never catches radio write pointer (satisfies TI errata workaround)
-                // (b) 1 packet complete and no active reception (GDO0 LOW)
-                bool can_read = (rxbytes >= 44) ||
-                                (rxbytes >= 22 && digitalRead(this->gdo0_pin_) == LOW);
-
-                if (!can_read) {
-                    if (rxbytes >= 22) gdo0_blocked_count_++;  // Diagnostic
-                    break;
-                }
-
-                uint8_t buffer[22];
-                this->qc_->readRxBurst(buffer, 22);
-                this->qc_->processPacket(buffer, 20, now);
-
-                // RSSI/LQI from APPEND_STATUS bytes
-                int8_t rssi_raw = (int8_t)buffer[20];
-                int rssi_dbm = (rssi_raw >= 128) ? (rssi_raw - 256) / 2 - 74 : rssi_raw / 2 - 74;
-                uint8_t lqi = buffer[21] & 0x7F;
-
-                // Log with source indicator
-                const char* source = (rssi_dbm > -70) ? "FAN" : "REMOTE";
-                ESP_LOGI(TAG, "RX [%s] RSSI=%d LQI=%d", source, rssi_dbm, lqi);
-
-                // Consume decoded command and sync HA state
-                auto rx_cmd = this->qc_->consumeRxCommand();
-                if (rx_cmd.valid && !rx_cmd.is_wake) {
-                    // Deduplication: ignore same command within 1 second
-                    static uint8_t last_rx_speed = 0;
-                    static uint8_t last_rx_duration = 0;
-                    static bool last_rx_was_off = false;
-                    static uint32_t last_rx_time = 0;
-
-                    bool is_duplicate = (now - last_rx_time < 1000) &&
-                                        (rx_cmd.is_off == last_rx_was_off) &&
-                                        (rx_cmd.speed == last_rx_speed) &&
-                                        (rx_cmd.duration == last_rx_duration);
-
-                    last_rx_speed = rx_cmd.speed;
-                    last_rx_duration = rx_cmd.duration;
-                    last_rx_was_off = rx_cmd.is_off;
-                    last_rx_time = now;
-
-                    if (!is_duplicate) {
-                        if (rx_cmd.is_off) {
-                            this->state = false;
-                            this->speed = 0;
-                            ESP_LOGI(TAG, "RX sync: OFF");
-                        } else {
-                            this->state = true;
-                            if (this->speed_count_ == 2) {
-                                if (rx_cmd.speed == 0x90) this->speed = 1;
-                                else this->speed = 2;
-                            } else {
-                                if (rx_cmd.speed == 0x90) this->speed = 1;
-                                else if (rx_cmd.speed == 0xA0) this->speed = 2;
-                                else this->speed = 3;
-                            }
-                            ESP_LOGI(TAG, "RX sync: ON speed=%d", this->speed);
-                        }
-                        this->publish_state();
-                    }
-                }
-
-                packets_this_loop++;
-                rx_packet_count_++;
-                if (packets_this_loop >= 5) break;  // Safety limit per loop iteration
-            }
-
-            // FIFO alignment recovery: residual bytes indicate misalignment
-            if (packets_this_loop > 0) {
-                uint8_t residual = this->qc_->getRxBytes() & 0x7F;
-                if (residual > 0 && residual < 22) {
-                    ESP_LOGW(TAG, "FIFO misaligned (%d residual bytes) - flushing", residual);
-                    this->qc_->recoverFromFifoError();
-                }
-            }
-        }
-
-        void QuietCoolFan::send_wake() {
-            if (this->qc_) {
-                this->qc_->sendWake();
-            }
-        }
-
-        void QuietCoolFan::control(const fan::FanCall &call) {
-            ESP_LOGD(TAG, "Control called: state=%s, speed=%s",
-                     call.get_state().has_value() ? (*call.get_state() ? "ON" : "OFF") : "<unchanged>",
-                     call.get_speed().has_value() ? (std::to_string(*call.get_speed())).c_str() : "<unchanged>");
-
-            // Store old state for logging
-            bool old_state = this->state;
-            int old_speed = this->speed;
-
-            // Handle state changes
-            if (call.get_state().has_value()) {
-                bool new_state = *call.get_state();
-
-                if (new_state) {
-                    // Turning ON
-                    if (call.get_speed().has_value()) {
-                        // Speed explicitly specified, use it
-                        this->speed = *call.get_speed();
-                    } else if (this->speed == 0 || !old_state) {
-                        // No speed specified and either:
-                        // - Current speed is 0, or
-                        // - We were previously OFF
-                        // Default to speed 1 (LOW)
-                        this->speed = 1;
-                        ESP_LOGD(TAG, "No speed specified, defaulting to speed 1");
-                    }
-                    // else: keep existing speed from previous ON state
-                    this->state = true;
-                } else {
-                    // Turning OFF
-                    this->state = false;
-                    this->speed = 0;
-                }
-            } else if (call.get_speed().has_value()) {
-                // Only speed changed, not state
-                int new_speed = *call.get_speed();
-                this->speed = new_speed;
-
-                if (new_speed == 0) {
-                    // Speed 0 means turn OFF
-                    this->state = false;
-                } else {
-                    // Non-zero speed means turn ON
-                    this->state = true;
-                }
-            }
-
-            // Now map internal state to hardware commands
-            QuietCoolSpeed qcspd = QUIETCOOL_SPEED_LOW;
-            QuietCoolDuration qcdur = QUIETCOOL_DURATION_ON;
-
-            int current_speed = this->speed;
-
-            if (!this->state || current_speed == 0) {
-                // Fan is OFF
-                qcdur = QUIETCOOL_DURATION_OFF;
-                qcspd = QUIETCOOL_SPEED_LOW;  // Doesn't matter, but be explicit
-            } else {
-                // Fan is ON, map speed to hardware
-                qcdur = QUIETCOOL_DURATION_ON;
-
-                if (this->speed_count_ == 2) {
-                    // 2-speed mode: speed 1 = LOW, speed 2 = HIGH
-                    if (current_speed == 1) {
-                        qcspd = QUIETCOOL_SPEED_LOW;
-                    } else {
-                        qcspd = QUIETCOOL_SPEED_HIGH;
-                    }
-                } else {
-                    // 3-speed mode: speed 1 = LOW, speed 2 = MEDIUM, speed 3 = HIGH
-                    if (current_speed == 1) {
-                        qcspd = QUIETCOOL_SPEED_LOW;
-                    } else if (current_speed == 2) {
-                        qcspd = QUIETCOOL_SPEED_MEDIUM;
-                    } else {
-                        qcspd = QUIETCOOL_SPEED_HIGH;
-                    }
-                }
-            }
-
-            // Send command to hardware
-            if (this->qc_) {
-                ESP_LOGI(TAG, "Sending to hardware: speed=0x%02X, duration=0x%02X", qcspd, qcdur);
-                this->qc_->send(qcspd, qcdur);
-                ESP_LOGI(TAG, "TX complete");
-            }
-
-            ESP_LOGI(TAG, "State updated: state=%s, speed=%d (was: state=%s, speed=%d)",
-                     this->state ? "ON" : "OFF", current_speed,
-                     old_state ? "ON" : "OFF", old_speed);
-
-            // Publish state to Home Assistant
-            // This will update both the on/off state and the percentage
-            this->publish_state();
-        }
-
-        void QuietCoolFan::write_state_() {
-            ESP_LOGVV(TAG, "write_state_: driving pins: state=%s ", 
-                      (this->state ? "ON" : "OFF"));
-            ESP_LOGVV(TAG, "write_state_: output calls completed");
-        }
-
-        void QuietCoolFan::dump_config() {
-            LOG_FAN("", "QuietCool fan", this);
-            ESP_LOGCONFIG(TAG, "  Setup called: %s", this->qc_ ? "YES" : "NO");
-            ESP_LOGCONFIG(TAG, "  Pins set: %s", this->pins_set_ ? "YES" : "NO");
-            ESP_LOGCONFIG(TAG, "  CS Pin: %d", this->csn_pin_);
-            ESP_LOGCONFIG(TAG, "  GDO0 Pin: %d", this->gdo0_pin_);
-            ESP_LOGCONFIG(TAG, "  GDO2 Pin: %d", this->gdo2_pin_);
-            ESP_LOGCONFIG(TAG, "  Speed Count: %d", this->speed_count_);
-        }
-    }  // namespace quiet_cool
+}  // namespace quiet_cool
 }  // namespace esphome
