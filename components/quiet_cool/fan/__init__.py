@@ -49,6 +49,7 @@ async def to_code(config):
     await cg.register_component(var, config)
     await fan.register_fan(var, config)
     await spi.register_spi_device(var, config)
+    cg.add_library("SPI", None)
 
     cg.add(var.set_pins(config[CONF_GDO0_PIN], config[CONF_GDO2_PIN]))
     if CONF_REMOTE_ID in config:
